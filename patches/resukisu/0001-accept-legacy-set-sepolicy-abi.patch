@@ -1,0 +1,222 @@
+ReSukiSU: accept the legacy SET_SEPOLICY ioctl ABI
+
+ReSukiSU (575ea1a) changed KSU_IOCTL_SET_SEPOLICY to the batched format of
+KernelSU v3.2.0: { u64 data_len; u64 data } pointing to a serialized payload.
+ksud v3.1.x still sends { u64 cmd = 0; u64 arg = &FfiPolicy }, one rule per
+call, so the kernel saw data_len == 0 and returned -EINVAL for every module
+sepolicy.rule ("apply rule ... failed: Invalid argument (os error 22)").
+
+Treat data_len == 0 as the legacy ABI: copy the FfiPolicy (cmd, subcmd,
+sepol1..7 user pointers, NULL = ALL), re-encode it as a one-command batch in
+kernel memory and run it through the existing batch parser and locking.
+The batched format keeps working unchanged.
+
+Apply inside the ReSukiSU checkout (kernel/KernelSU) with patch -p1.
+
+diff --git a/kernel/selinux/rules.c b/kernel/selinux/rules.c
+index 4e0a683b..9845b7b2 100644
+--- a/kernel/selinux/rules.c
++++ b/kernel/selinux/rules.c
+@@ -506,30 +506,16 @@ static int apply_one_sepolicy_cmd(struct policydb *db,
+     }
+ }
+ 
+-int handle_sepolicy(void __user *user_data, u64 data_len)
++// Apply a serialized batch that already lives in kernel memory.
++// Returns the number of commands that applied, or a negative errno.
++static int ksu_apply_sepolicy_batch(const u8 *payload, size_t data_len)
+ {
+     struct policydb *db;
+     struct sepol_batch_cursor cursor;
+-    u8 *payload;
+     int ret = 0;
+     int success_cmd_count = 0;
+     u32 cmd_index = 0;
+ 
+-    if (!user_data || !data_len)
+-        return -EINVAL;
+-
+-    if (data_len > KSU_SEPOLICY_MAX_BATCH_SIZE)
+-        return -E2BIG;
+-
+-    payload = vmalloc((size_t)data_len);
+-    if (!payload)
+-        return -ENOMEM;
+-
+-    if (copy_from_user(payload, user_data, (size_t)data_len)) {
+-        ret = -EFAULT;
+-        goto out_free;
+-    }
+-
+     if (!getenforce()) {
+         pr_info("SELinux permissive or disabled when handle policy!\n");
+     }
+@@ -562,7 +548,7 @@ int handle_sepolicy(void __user *user_data, u64 data_len)
+ #endif
+ 
+     cursor.cur = payload;
+-    cursor.end = payload + (size_t)data_len;
++    cursor.end = payload + data_len;
+ 
+     ret = 0;
+     success_cmd_count = 0;
+@@ -627,13 +613,128 @@ out_unlock:
+     reset_avc_cache();
+ 
+     ret = success_cmd_count;
+-    goto out_free;
++    goto out;
+ 
+ out_drop_new_policy:
+     ksu_unlock_sepolicy_legacy();
+ #endif
++out:
++    return ret;
++}
++
++int handle_sepolicy(void __user *user_data, u64 data_len)
++{
++    u8 *payload;
++    int ret;
++
++    if (!user_data || !data_len)
++        return -EINVAL;
++
++    if (data_len > KSU_SEPOLICY_MAX_BATCH_SIZE)
++        return -E2BIG;
++
++    payload = vmalloc((size_t)data_len);
++    if (!payload)
++        return -ENOMEM;
++
++    if (copy_from_user(payload, user_data, (size_t)data_len)) {
++        ret = -EFAULT;
++        goto out_free;
++    }
++
++    ret = ksu_apply_sepolicy_batch(payload, (size_t)data_len);
++
+ out_free:
+     vfree(payload);
++    return ret;
++}
++
++// Legacy SET_SEPOLICY ABI used by ksud <= v3.1.x: one command per ioctl,
++// arg points to { u32 cmd; u32 subcmd; const char *sepol1..7; }, and a NULL
++// string means ALL. It is converted to a one-command batch so both formats
++// share the same parser and locking.
++#define KSU_SEPOLICY_LEGACY_ARGS 7
++#define KSU_SEPOLICY_LEGACY_MAX_LEN 256
++
++struct sepol_legacy_data {
++    u32 cmd;
++    u32 subcmd;
++    u64 sepol[KSU_SEPOLICY_LEGACY_ARGS];
++};
++
++int handle_sepolicy_legacy(void __user *arg)
++{
++    struct sepol_legacy_data data;
++    struct sepol_data header;
++    char *strs;
++    u32 lens[KSU_SEPOLICY_MAX_ARGS] = { 0 };
++    size_t total;
++    u8 *payload, *p;
++    int argc, i, ret;
++
++    if (!arg)
++        return -EINVAL;
++
++    if (copy_from_user(&data, arg, sizeof(data)))
++        return -EFAULT;
+ 
++    argc = sepol_expected_argc(data.cmd);
++    if (argc < 0 || argc > KSU_SEPOLICY_MAX_ARGS) {
++        pr_err("sepol: legacy: invalid cmd %u.\n", data.cmd);
++        return -EINVAL;
++    }
++
++    strs = kzalloc(KSU_SEPOLICY_MAX_ARGS * KSU_SEPOLICY_LEGACY_MAX_LEN,
++                   GFP_KERNEL);
++    if (!strs)
++        return -ENOMEM;
++
++    total = sizeof(header);
++    for (i = 0; i < argc; i++) {
++        char *buf = strs + i * KSU_SEPOLICY_LEGACY_MAX_LEN;
++        long n;
++
++        if (data.sepol[i]) {
++            n = strncpy_from_user(buf, (const char __user *)data.sepol[i],
++                                  KSU_SEPOLICY_LEGACY_MAX_LEN);
++            if (n < 0) {
++                ret = -EFAULT;
++                goto out_strs;
++            }
++            if (n >= KSU_SEPOLICY_LEGACY_MAX_LEN) {
++                ret = -ENAMETOOLONG;
++                goto out_strs;
++            }
++            lens[i] = (u32)n;
++        }
++        // NULL (ALL) is encoded as len 0, same as the batch format
++        total += sizeof(u32) + lens[i] + 1;
++    }
++
++    payload = kzalloc(total, GFP_KERNEL);
++    if (!payload) {
++        ret = -ENOMEM;
++        goto out_strs;
++    }
++
++    header.cmd = data.cmd;
++    header.subcmd = data.subcmd;
++    p = payload;
++    memcpy(p, &header, sizeof(header));
++    p += sizeof(header);
++    for (i = 0; i < argc; i++) {
++        memcpy(p, &lens[i], sizeof(u32));
++        p += sizeof(u32);
++        memcpy(p, strs + i * KSU_SEPOLICY_LEGACY_MAX_LEN, lens[i]);
++        p += lens[i] + 1; // trailing '\0' comes from kzalloc
++    }
++
++    ret = ksu_apply_sepolicy_batch(payload, total);
++    if (ret >= 0)
++        ret = ret == 1 ? 0 : -EINVAL;
++
++    kfree(payload);
++out_strs:
++    kfree(strs);
+     return ret;
+-}
+\ No newline at end of file
++}
+diff --git a/kernel/selinux/selinux.h b/kernel/selinux/selinux.h
+index 6a0e11d7..99b0edad 100644
+--- a/kernel/selinux/selinux.h
++++ b/kernel/selinux/selinux.h
+@@ -38,6 +38,7 @@ bool is_init(const struct cred *cred);
+ void apply_kernelsu_rules(void);
+ 
+ int handle_sepolicy(void __user *user_data, u64 data_len);
++int handle_sepolicy_legacy(void __user *arg);
+ 
+ void setup_ksu_cred(void);
+ 
+diff --git a/kernel/supercalls.c b/kernel/supercalls.c
+index d8146fbe..5b2427b9 100644
+--- a/kernel/supercalls.c
++++ b/kernel/supercalls.c
+@@ -161,6 +161,11 @@ static int do_set_sepolicy(void __user *arg)
+         return -EFAULT;
+     }
+ 
++    // ksud <= v3.1.x sends { cmd = 0, arg = &legacy_policy }. A batch with
++    // data_len 0 is invalid anyway, so use it to tell the two ABIs apart.
++    if (!cmd.data_len)
++        return handle_sepolicy_legacy((void __user *)cmd.data);
++
+     return handle_sepolicy((void __user *)cmd.data, cmd.data_len);
+ }
+ 

@@ -120,6 +120,20 @@ jobs:
           git -C KernelSU log -1 --format='ReSukiSU: %H %ci %s'
           ls -la drivers/kernelsu
 
+      - name: Apply ReSukiSU patches (legacy SET_SEPOLICY ABI for ksud 3.1.x)
+        working-directory: kernel
+        run: |
+          set -e
+          for p in "$GITHUB_WORKSPACE"/self/patches/resukisu/*.patch; do
+            echo "::group::$(basename "$p")"
+            patch -d KernelSU -p1 --forward --no-backup-if-mismatch < "$p"
+            echo "::endgroup::"
+          done
+          if [ -n "$(find KernelSU -name '*.rej' -print -quit)" ]; then
+            echo "::error::ReSukiSU patch rejects"; exit 1
+          fi
+          grep -n 'handle_sepolicy_legacy' KernelSU/kernel/supercalls.c
+
       - name: Install build dependencies
         run: |
           sudo apt-get update
