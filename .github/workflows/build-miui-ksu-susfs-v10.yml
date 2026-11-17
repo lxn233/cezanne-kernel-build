@@ -1,0 +1,313 @@
+name: Build MIUI kernel v9 (ReSukiSU rc3, SUSFS compat shim)
+
+# Builds a drop-in boot.img for Redmi K30 Ultra (cezanne) on MIUI
+# 12.5.11 stable or 13 developer build 22.2.17 (both Android 11):
+#   - source:    MiCode/Xiaomi_Kernel_OpenSource @ cezanne-r-oss (4.14.186)
+#   - config:    IKCONFIG extracted from the stock kernel of the target ROM
+#   - note:      22.2.17 userspace calls the MDP driver with a 344-byte
+#                mdp_submit that the public source does not have, which
+#                hangs video/SystemUI; 12.5.11 matches the source (336)
+#   - version:   uname -r pinned to the stock string so vendor .ko load
+#   - root:      ReSukiSU (SukiSU-Ultra fork that keeps non-GKI support)
+#   - hiding:    SUSFS v2.1.0 non-GKI backport + inline hooks
+# The stock boot.img is pulled from the official OTA zip with HTTP range
+# requests, and only its kernel is swapped (ramdisk, dtb, header untouched).
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Target ROM
+        type: choice
+        options: ['12.5.11', '22.2.17']
+        default: '12.5.11'
+      ksu_ref:
+        description: ReSukiSU commit (pinned to match the SUSFS v2.1.0 backport)
+        required: true
+        default: 575ea1a164a8ee925c789fdd806e9dd383babeeb
+      relax_modversions:
+        description: Load vendor .ko even when a symbol CRC differs (warn instead of refuse)
+        type: boolean
+        default: true
+  push:
+    branches: [feat/miui-sukisu-susfs]
+    paths:
+      - .github/workflows/build-miui-ksu-susfs.yml
+      - patches/miui/**
+      - configs/**
+      - tools/**
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    env:
+      # push runs have no inputs, so every value falls back to its default
+      TARGET: ${{ inputs.target || '12.5.11' }}
+      KSU_REF: ${{ inputs.ksu_ref || '575ea1a164a8ee925c789fdd806e9dd383babeeb' }}
+      RELAX_MODVERSIONS: ${{ github.event_name == 'push' && 'true' || inputs.relax_modversions }}
+      KERNEL_RELEASE_BASE: 4.14.186
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          path: self
+          ref: feat/miui-sukisu-susfs
+      - name: Select target ROM
+        run: |
+          # STOCK_SUFFIX is not named LOCALVERSION: kbuild appends that env var
+          # to the release string a second time.
+          case "$TARGET" in
+            12.5.11)
+              echo "STOCK_SUFFIX=-gbc682460573f" >> "$GITHUB_ENV"
+              echo "STOCK_BUILD_HOST=c4-xm-ota-bd028.bj" >> "$GITHUB_ENV"
+              echo "STOCK_CONFIG=cezanne-12.5.11-stock.config" >> "$GITHUB_ENV"
+              echo "ROM_URL=https://bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com/V12.5.11.0.RJNCNXM/miui_CEZANNE_V12.5.11.0.RJNCNXM_30f7f0b596_11.0.zip" >> "$GITHUB_ENV"
+              ;;
+            22.2.17)
+              echo "STOCK_SUFFIX=-gdc97011ef0c6" >> "$GITHUB_ENV"
+              echo "STOCK_BUILD_HOST=m1-xm-ota-bd334.bj.idc.xiaomi.com" >> "$GITHUB_ENV"
+              echo "STOCK_CONFIG=cezanne-22.2.17-stock.config" >> "$GITHUB_ENV"
+              echo "ROM_URL=https://bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com/22.2.17/miui_CEZANNE_22.2.17_106edbe449_11.0.zip" >> "$GITHUB_ENV"
+              ;;
+            *) echo "::error::unknown target $TARGET"; exit 1 ;;
+          esac
+
+      - name: Clone kernel source (MiCode cezanne-r-oss)
+        run: |
+          git clone --depth=1 -b cezanne-r-oss https://github.com/MiCode/Xiaomi_Kernel_OpenSource.git kernel
+          git -C kernel log -1 --format='source commit: %H %ci'
+          # no .git => LOCALVERSION_AUTO / setlocalversion cannot append -g<sha>
+          rm -rf kernel/.git
+
+      - name: Apply patches (path_umount, SUSFS v2.1.0, KSU hooks)
+        working-directory: kernel
+        run: |
+          set -e
+          fail=0
+          for p in "$GITHUB_WORKSPACE"/self/patches/miui/*.patch; do
+            echo "::group::$(basename "$p")"
+            if ! patch -p1 --forward --no-backup-if-mismatch < "$p"; then fail=1; fi
+            echo "::endgroup::"
+          done
+          if [ "$fail" = 1 ] || [ -n "$(find . -name '*.rej' -print -quit)" ]; then
+            echo "::error::patch rejects"
+            find . -name '*.rej' -exec sh -c 'echo "=== $1"; cat "$1"' _ {} \;
+            exit 1
+          fi
+
+      - name: Strip legacy KSU bool hook guards (SUSFS static_key)
+        working-directory: kernel
+        run: |
+          set -e
+          echo "=== before: legacy bool guards ==="
+          grep -n 'ksu_init_rc_hook' fs/read_write.c fs/stat.c || true
+          grep -n 'ksu_input_hook' drivers/input/input.c || true
+          # never call a legacy hook unconditionally: drop the if-guard AND its call line
+          sed -i '/if (unlikely(ksu_init_rc_hook))/,+1d' fs/read_write.c fs/stat.c
+          sed -i '/if (unlikely(ksu_input_hook))/,+1d' drivers/input/input.c
+          # drop incompatible extern bool declarations
+          sed -i '/extern bool ksu_init_rc_hook/d' fs/read_write.c fs/stat.c
+          sed -i '/extern bool ksu_input_hook/d' drivers/input/input.c
+          sed -i '/extern bool ksu_execveat_hook/d' fs/exec.c
+          sed -i '/ksu_vfs_read_hook/d' fs/read_write.c
+          # safety net for any leftovers
+          sed -i '/ksu_init_rc_hook/d' fs/read_write.c fs/stat.c
+          sed -i '/ksu_input_hook/d' drivers/input/input.c
+          if grep -q 'ksu_init_rc_hook' fs/read_write.c fs/stat.c; then
+            echo "::error::ksu_init_rc_hook still present"; exit 1
+          fi
+          if grep -q 'ksu_input_hook' drivers/input/input.c; then
+            echo "::error::ksu_input_hook still present"; exit 1
+          fi
+          echo "=== required hooks (must all be > 0) ==="
+          for pair in fs/read_write.c:ksu_handle_sys_read fs/stat.c:ksu_handle_vfs_fstat fs/stat.c:ksu_handle_stat drivers/input/input.c:ksu_handle_input_handle_event kernel/sys.c:ksu_handle_setresuid fs/exec.c:ksu_handle_execveat fs/open.c:ksu_handle_faccessat kernel/reboot.c:ksu_handle_sys_reboot; do
+            file=$(echo "$pair" | cut -d: -f1)
+            sym=$(echo "$pair" | cut -d: -f2)
+            n=$(grep -c "$sym" "$file" || true)
+            echo "  $sym in $file = $n"
+            if [ "$n" -eq 0 ]; then echo "::error::missing $sym in $file"; exit 1; fi
+          done
+
+      - name: Inject SUSFS v2.3.0 compat shim (ReSukiSU rc3)
+        working-directory: kernel
+        run: |
+          set -e
+          python3 - <<'PY'
+          import io
+          p = 'include/linux/susfs_def.h'
+          s = io.open(p, encoding='utf-8', newline='').read()
+          if 'TIF_PROC_NO_SU' not in s:
+              s = s.replace('#define TIF_PROC_UMOUNTED 33',
+                            '#define TIF_PROC_UMOUNTED 33\n'
+                            '#define TIF_PROC_NO_SU 34\n'
+                            '#define TIF_PROC_UMOUNTED_FOR_ZYGOTE_NEXT 35')
+          if 'susfs_is_current_proc_no_su' not in s:
+              b = ('\nstatic inline bool susfs_is_current_proc_no_su(void) {\n'
+                   '\treturn test_ti_thread_flag(&current->thread_info, TIF_PROC_NO_SU);\n}\n\n'
+                   'static inline void susfs_set_current_proc_no_su(void) {\n'
+                   '\tset_ti_thread_flag(&current->thread_info, TIF_PROC_NO_SU);\n}\n\n'
+                   'static inline void susfs_clear_current_proc_no_su(void) {\n'
+                   '\tclear_bit(TIF_PROC_NO_SU, &current->thread_info.flags);\n}\n\n'
+                   'static inline bool susfs_is_current_proc_umounted_for_zygote_next(void) {\n'
+                   '\treturn test_ti_thread_flag(&current->thread_info, TIF_PROC_UMOUNTED_FOR_ZYGOTE_NEXT);\n}\n\n'
+                   'static inline void susfs_set_current_proc_umounted_for_zygote_next(void) {\n'
+                   '\tset_ti_thread_flag(&current->thread_info, TIF_PROC_UMOUNTED_FOR_ZYGOTE_NEXT);\n}\n\n'
+                   'static inline void susfs_clear_current_proc_umounted_for_zygote_next(void) {\n'
+                   '\tclear_bit(TIF_PROC_UMOUNTED_FOR_ZYGOTE_NEXT, &current->thread_info.flags);\n}\n')
+              s = s.replace('#endif // #ifndef KSU_SUSFS_DEF_H', b + '\n#endif // #ifndef KSU_SUSFS_DEF_H')
+          io.open(p, 'w', encoding='utf-8', newline='').write(s)
+
+          p = 'fs/susfs.c'
+          s = io.open(p, encoding='utf-8', newline='').read()
+          if 'susfs_extra_works' not in s:
+              old = '/* susfs_init */\nvoid susfs_init(void) {'
+              new = ('struct work_struct susfs_extra_works;\n'
+                     'static void susfs_run_extra_works(struct work_struct *work) {\n'
+                     '\t(void)work;\n'
+                     '#ifdef CONFIG_KSU_SUSFS_SUS_PATH\n'
+                     '\tsusfs_run_sus_path_loop();\n'
+                     '#endif\n}\n\n'
+                     '/* susfs_init */\nvoid susfs_init(void) {\n'
+                     '\tSUSFS_LOGI(\"Initializing susfs_extra_works\\n\");\n'
+                     '\tINIT_WORK(&susfs_extra_works, susfs_run_extra_works);')
+              assert old in s, 'susfs_init anchor not found'
+              s = s.replace(old, new, 1)
+          io.open(p, 'w', encoding='utf-8', newline='').write(s)
+
+          p = 'include/linux/susfs.h'
+          s = io.open(p, encoding='utf-8', newline='').read()
+          if 'susfs_extra_works' not in s:
+              anchor = '/* susfs_init */\nvoid susfs_init(void);'
+              assert anchor in s, 'susfs_init decl not found'
+              s = s.replace(anchor, 'extern struct work_struct susfs_extra_works;\n\n' + anchor, 1)
+          io.open(p, 'w', encoding='utf-8', newline='').write(s)
+          print('compat shim injected')
+          PY
+          echo "=== verify shim ==="
+          for pair in include/linux/susfs_def.h:TIF_PROC_NO_SU include/linux/susfs_def.h:susfs_is_current_proc_no_su include/linux/susfs_def.h:susfs_is_current_proc_umounted_for_zygote_next fs/susfs.c:susfs_extra_works fs/susfs.c:susfs_run_extra_works include/linux/susfs.h:susfs_extra_works; do
+            f=$(echo "$pair" | cut -d: -f1)
+            s=$(echo "$pair" | cut -d: -f2)
+            n=$(grep -c "$s" "$f" || true)
+            echo "  $s in $f = $n"
+            [ "$n" -gt 0 ] || { echo "::error::shim missing $s in $f"; exit 1; }
+          done
+
+      - name: Relax module CRC check (optional)
+        if: env.RELAX_MODVERSIONS == 'true'
+        working-directory: kernel
+        run: |
+          set -e
+          # check_version(): on CRC mismatch keep the warning but accept the module,
+          # so vendor .ko built against the stock tree still load. vermagic must
+          # still match, which the pinned LOCALVERSION guarantees.
+          perl -0pi -e 's/(bad_version:\s*pr_warn\("%s: disagrees about version of symbol %s\\n",\s*info->name, symname\);\s*return )0;/${1}1;/' kernel/module.c
+          grep -n -A4 'bad_version:' kernel/module.c
+          grep -Pzoq 'bad_version:\s*pr_warn\([^;]*;\s*return 1;' kernel/module.c \
+            || { echo "::error::could not relax check_version"; exit 1; }
+
+      - name: Integrate ReSukiSU
+        working-directory: kernel
+        run: |
+          set -e
+          curl -fsSL "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/$KSU_REF/kernel/setup.sh" | bash -s "$KSU_REF"
+          git -C KernelSU log -1 --format='ReSukiSU: %H %ci %s'
+          ls -la drivers/kernelsu
+
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential cpio flex git kmod libelf-dev libssl-dev \
+            lz4 lzop python3 unzip xz-utils zip libtinfo5 libncurses5
+
+      - name: Download toolchain (clang-r383902 + GCC 4.9, same as stock)
+        run: |
+          set -e
+          base=https://android.googlesource.com/platform/prebuilts
+          mkdir -p tc/clang tc/gcc64 tc/gcc32
+          curl -fsSL --retry 5 "$base/clang/host/linux-x86/+archive/refs/tags/android-11.0.0_r48/clang-r383902.tar.gz" | tar -xz -C tc/clang
+          curl -fsSL --retry 5 "$base/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/android-11.0.0_r48.tar.gz" | tar -xz -C tc/gcc64
+          curl -fsSL --retry 5 "$base/gcc/linux-x86/arm/arm-linux-androideabi-4.9/+archive/refs/tags/android-11.0.0_r48.tar.gz" | tar -xz -C tc/gcc32
+          tc/clang/bin/clang --version | head -1
+
+      - name: Configure
+        working-directory: kernel
+        run: |
+          set -e
+          export PATH="$GITHUB_WORKSPACE/tc/clang/bin:$GITHUB_WORKSPACE/tc/gcc64/bin:$GITHUB_WORKSPACE/tc/gcc32/bin:$PATH"
+          M=(O=out ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu-
+             CROSS_COMPILE=aarch64-linux-android- CROSS_COMPILE_ARM32=arm-linux-androideabi-
+             LD=ld.lld NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump
+             READELF=llvm-readelf AR=llvm-ar STRIP=llvm-strip)
+          mkdir -p out
+          cp "$GITHUB_WORKSPACE/self/configs/$STOCK_CONFIG" out/.config
+          while IFS= read -r line; do
+            case "$line" in
+              CONFIG_*=y) scripts/config --file out/.config -e "${line%%=*}" ;;
+              "# CONFIG_"*" is not set") s=${line#\# }; scripts/config --file out/.config -d "${s%% *}" ;;
+            esac
+          done < "$GITHUB_WORKSPACE/self/configs/ksu-susfs.fragment"
+          scripts/config --file out/.config -d LOCALVERSION_AUTO --set-str LOCALVERSION "$STOCK_SUFFIX"
+          # ReSukiSU rc3 requires static symbol exports unless KALLSYMS_ALL is on
+          scripts/config --file out/.config -e KALLSYMS_ALL
+          make "${M[@]}" olddefconfig
+          echo "== KALLSYMS:"; grep -E '^(# )?CONFIG_KALLSYMS' out/.config
+          echo "== KSU/SUSFS options:"; grep -E '^(# )?CONFIG_(KSU|KPM)' out/.config
+          missing=""
+          while IFS= read -r line; do
+            case "$line" in CONFIG_*=y) grep -qx "$line" out/.config || missing="$missing ${line%%=*}" ;; esac
+          done < "$GITHUB_WORKSPACE/self/configs/ksu-susfs.fragment"
+          [ -z "$missing" ] || { echo "::error::options not applied:$missing"; exit 1; }
+          make "${M[@]}" -s kernelrelease | tee ../kernelrelease.txt
+          [ "$(cat ../kernelrelease.txt)" = "$KERNEL_RELEASE_BASE$STOCK_SUFFIX" ] \
+            || { echo "::error::kernelrelease does not match stock"; exit 1; }
+
+      - name: Build Image.gz
+        working-directory: kernel
+        run: |
+          set -eo pipefail
+          export PATH="$GITHUB_WORKSPACE/tc/clang/bin:$GITHUB_WORKSPACE/tc/gcc64/bin:$GITHUB_WORKSPACE/tc/gcc32/bin:$PATH"
+          export KBUILD_BUILD_USER=builder KBUILD_BUILD_HOST="$STOCK_BUILD_HOST"
+          M=(O=out ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu-
+             CROSS_COMPILE=aarch64-linux-android- CROSS_COMPILE_ARM32=arm-linux-androideabi-
+             LD=ld.lld NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump
+             READELF=llvm-readelf AR=llvm-ar STRIP=llvm-strip)
+          make -j"$(nproc)" "${M[@]}" Image.gz 2>&1 | tee ../build.log | grep -E -- '^-- |error|warning: .*ksu|susfs' || true
+          test -f out/arch/arm64/boot/Image.gz
+          strings out/vmlinux | grep -m1 "Linux version"
+
+      - name: Repack stock boot.img with the new kernel
+        run: |
+          set -e
+          python3 -I self/tools/remotezip.py "$ROM_URL" get boot.img stock-boot.img
+          curl -fsSL -o magisk.apk https://github.com/topjohnwu/Magisk/releases/download/v28.1/Magisk-v28.1.apk
+          unzip -p magisk.apk lib/x86_64/libmagiskboot.so > magiskboot && chmod +x magiskboot
+          mkdir rp && cd rp
+          ../magiskboot unpack ../stock-boot.img
+          cp ../kernel/out/arch/arm64/boot/Image.gz kernel
+          ../magiskboot repack ../stock-boot.img ../boot-ksu-susfs.img
+          cd .. && ls -l stock-boot.img boot-ksu-susfs.img
+
+      - name: Collect artifacts
+        if: always()
+        run: |
+          mkdir -p dist
+          cp -v boot-ksu-susfs.img stock-boot.img dist/ 2>/dev/null || true
+          cp -v kernel/out/arch/arm64/boot/Image.gz dist/ 2>/dev/null || true
+          cp -v kernel/out/.config dist/kernel.config 2>/dev/null || true
+          cp -v kernelrelease.txt dist/ 2>/dev/null || true
+          tail -n 400 build.log > dist/build-tail.log 2>/dev/null || true
+          grep -E -- '^-- ' build.log > dist/ksu-build-info.log 2>/dev/null || true
+          (cd dist && sha256sum * > SHA256SUMS) || true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cezanne-${{ env.TARGET }}-resukisu-susfs-${{ github.run_number }}
+          path: dist/
