@@ -55,6 +55,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: self
+          ref: feat/miui-sukisu-susfs
 
       - name: Select target ROM
         run: |
