@@ -1,0 +1,44 @@
+name: Build ReSukiSU Manager 34681
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-manager:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout BakaSU at the kernel-34681 commit
+        uses: actions/checkout@v4
+        with:
+          repository: Baka-SU/BakaSU
+          ref: 575ea1a164a8ee925c789fdd806e9dd383babeeb
+          fetch-depth: 0
+
+      - name: Show derived version
+        run: |
+          cd manager
+          CNT=$(git rev-list --count HEAD)
+          echo "commit count = $CNT"
+          echo "expected versionCode = $((30000 + CNT + 700))"
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Build debug APK
+        working-directory: manager
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: resukisu-manager-34681-debug
+          path: manager/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
